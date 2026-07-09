@@ -1,0 +1,21 @@
+name: Auto-Register
+
+on:
+  push:
+    tags: ["*"]
+
+jobs:
+  register:
+    name: Register new version
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Trigger JuliaRegistrator
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "@JuliaRegistrator register" \
+            --body "Auto-triggered by tag: \`${{ github.ref_name }}\`"
+        env:
+          GH_TOKEN: ${{ github.token }}
