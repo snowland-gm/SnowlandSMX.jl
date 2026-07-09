@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["*"]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - "1.6"         # minimum supported
+          - "1"           # latest stable
+          - "lts"         # long-term support
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        include:
+          - version: "nightly"
+            os: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          arch: x64
+
+      - name: Cache artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Install dependencies
+        shell: julia --project=@{0}
+        run: |
+          using Pkg
+          Pkg.instantiate()
+
+      - name: Show version info
+        shell: julia --project=@{0}
+        run: |
+          using InteractiveUtils
+          versioninfo()
+
+      - name: Run tests
+        shell: julia --project=@{0}
+        run: |
+          include("test/runtests.jl")
