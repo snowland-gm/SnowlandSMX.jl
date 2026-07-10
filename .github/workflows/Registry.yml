@@ -1,8 +1,8 @@
 name: Auto-Register
 
 on:
-  push:
-    tags: ["*"]
+  release:
+    types: [published]
 
 jobs:
   register:
@@ -16,6 +16,6 @@ jobs:
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "@JuliaRegistrator register" \
-            --body "Auto-triggered by tag: \`${{ github.ref_name }}\`"
+            --body "Auto-triggered by release: \`${{ github.ref_name }}\`"
         env:
           GH_TOKEN: ${{ github.token }}
