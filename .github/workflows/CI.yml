@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, dev]
     tags: ["*"]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - "1.6"         # minimum supported
+          - "1.10"        # minimum supported
           - "1"           # latest stable
           - "lts"         # long-term support
         os:
