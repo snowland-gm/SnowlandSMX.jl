@@ -73,7 +73,7 @@ Pkg.develop(path=".")
 
 ## 依赖
 
-- Julia >= 1.6
+- Julia >= 1.10
 - [CryptoGroups.jl](https://github.com/dfinity/CryptoGroups.jl) >= 0.6（SM2/SM9 椭圆曲线点运算）
 - [OpenSSL.jl](https://github.com/JuliaCrypto/OpenSSL.jl)（可选，用于性能对比）
 

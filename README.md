@@ -7,7 +7,7 @@ Chinese Commercial Cryptography Suite in pure Julia.
 SnowlandSMX.jl implements the complete set of Chinese national cryptographic
 standards (GM/T) as specified by the State Cryptography Administration of China.
 
-**Version:** 0.1.0 | **License:** BSD 3-Clause | **Julia:** >= 1.6
+**Version:** 0.1.0 | **License:** BSD 3-Clause | **Julia:** >= 1.10
 
 ## Project Structure
 
@@ -74,7 +74,7 @@ Pkg.develop(path=".")
 
 ## Dependencies
 
-- Julia >= 1.6
+- Julia >= 1.10
 - [CryptoGroups.jl](https://github.com/dfinity/CryptoGroups.jl) >= 0.6 (EC point operations for SM2/SM9)
 - [OpenSSL.jl](https://github.com/JuliaCrypto/OpenSSL.jl) (optional, for benchmark comparison)
 
