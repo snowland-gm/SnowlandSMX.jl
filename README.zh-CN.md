@@ -176,74 +176,35 @@ julia --project=. -e "using SnowlandSMX.ZUC; include(\"test/zuc_test.jl\")"
 
 ## 文档
 
-完整 API 参考文档：[doc/API.md](doc/API.md)
+- 完整 API 参考：[doc/v0_1_0/API.zh-CN.md](doc/v0_1_0/API.zh-CN.md)
+- 性能测试报告：[doc/v0_1_0/BENCHMARK.zh-CN.md](doc/v0_1_0/BENCHMARK.zh-CN.md)
 
-## 性能对比
+## 性能（摘要）
 
 基于 Windows 10 x64, Julia 1.12.6, CPU: i7-12700H 实测。
-纯 Julia 实现与 OpenSSL 3.x EVP API 对比。
 
-### SM4 分组密码 (ECB & CBC)
+| 算法   | 类型        | 纯 Julia   | vs OpenSSL    |
+|--------|------------|------------|---------------|
+| SM4 ECB| 分组密码    | 78 MB/s    | 慢 1.5 倍     |
+| SM4 CTR| 流式        | 77 MB/s    | N/A           |
+| SM3    | 哈希        | 107 MB/s   | N/A           |
+| SM2 签名| ECC        | 3.8 ms/次  | 慢 6.4 倍     |
+| SM2 验签| ECC        | 5.5 ms/次  | 慢 18.4 倍    |
+| SM9    | 标识密码    | 2-4 ms/次  | N/A           |
+| ZUC    | 流密码      | 33 MB/s    | N/A           |
 
-**ECB 加密：**
-
-| 大小   | Julia (ms) | Julia (MB/s) | OpenSSL (ms) | OpenSSL (MB/s) | 比值 |
-|--------|-----------|-------------|-------------|----------------|------|
-| 16 B   | 0.0005    | 32.0        | --          | --             | --   |
-| 1 KB   | 0.012     | 84.7        | 0.008       | 130.5          | 1.5x |
-| 64 KB  | 0.748     | 85.6        | 0.488       | 131.3          | 1.5x |
-| 1 MB   | 12.68     | 78.9        | 9.17        | 109.0          | 1.4x |
-
-- **密钥扩展开销：** < 0.001 ms
-- SM4 纯 Julia 仅比 OpenSSL 手写汇编**慢 1.4-1.5 倍**
-
-### SM3 哈希（纯 Julia）
-
-| 大小  | 一次性 (ms) | 一次性 (MB/s) | 流式 (ms) | 流式 (MB/s) |
-|-------|-----------|--------------|----------|-------------|
-| 16 B  | 0.0004    | 40.0         | 0.0006   | 26.7        |
-| 1 KB  | 0.012     | 81.3         | 0.014    | 73.9        |
-
-- 稳态吞吐量：**约 80 MB/s**
-
-### SM2 ECC 操作
-
-| 操作   | 纯 Julia  | OpenSSL EVP | 比值  |
-|--------|----------|-------------|-------|
-| 密钥生成 | 2.106 ms | 0.413 ms    | 5.1x  |
-| 签名   | 2.166 ms | 0.537 ms    | 4.0x  |
-| 验签   | 4.816 ms | 0.363 ms    | 13.3x |
-| 加密   | 5.448 ms | 0.852 ms    | 6.4x  |
-| 解密   | 2.649 ms | 0.558 ms    | 4.7x  |
-
-### SM9 IBE 操作（纯 Julia）
-
-| 操作            | 延迟    |
-|-----------------|---------|
-| 主密钥生成       | 4.04 ms |
-| 用户密钥提取     | 2.32 ms |
-| G1 哈希到点      | 3.79 ms |
-| G1 标量乘法      | 3.70 ms |
-| 参数验证         | 6.9 us  |
-
-### ZUC 流密码（纯 Julia）
-
-| 大小    | 加密 (ms) | 加密 (MB/s) |
-|---------|---------|------------|
-| 1 KB    | 0.027   | 37.0       |
-| 64 KB   | 1.894   | 33.8       |
-| 100 KB  | 2.557   | 39.1       |
+**关键结论：** SM4 纯 Julia 仅比 OpenSSL 汇编慢 1.4-1.6 倍。
+详见[性能测试详情](doc/v0_1_0/BENCHMARK.zh-CN.md)。
 
 ### 运行性能测试
 
 ```bash
-# 纯 Julia（始终可用）：
+# 纯 Julia：
 julia --project=. demo/benchmark/run_benchmarks.jl
 
-# 含 OpenSSL 完整对比：
+# 含 OpenSSL 对比：
 julia --project=. demo/benchmark/sm4_benchmark.jl
 julia --project=. demo/benchmark/sm2_benchmark.jl
-julia --project=. demo/benchmark/sm9_benchmark.jl
 ```
 
 ## 示例

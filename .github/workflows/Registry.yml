@@ -13,9 +13,8 @@ jobs:
     steps:
       - name: Trigger JuliaRegistrator
         run: |
-          gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "@JuliaRegistrator register" \
-            --body "Auto-triggered by release: \`${{ github.ref_name }}\`"
+          gh api \
+            repos/${{ github.repository }}/commits/${{ github.sha }}/comments \
+            -f body='@JuliaRegistrator register'
         env:
           GH_TOKEN: ${{ github.token }}

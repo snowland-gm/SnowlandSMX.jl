@@ -177,74 +177,35 @@ julia --project=. -e "using SnowlandSMX.ZUC; include(\"test/zuc_test.jl\")"
 
 ## Documentation
 
-Full API reference: [doc/API.md](doc/API.md)
+- Full API reference: [doc/v0_1_0/API.md](doc/v0_1_0/API.md)
+- Performance benchmarks: [doc/v0_1_0/BENCHMARK.md](doc/v0_1_0/BENCHMARK.md)
 
-## Performance
+## Performance (Summary)
 
 All benchmarks measured on Windows 10 x64, Julia 1.12.6, CPU: i7-12700H.
-Pure Julia vs OpenSSL 3.x EVP API comparison (where available).
 
-### SM4 Block Cipher (ECB & CBC)
+| Algorithm | Type         | Pure Julia | vs OpenSSL     |
+|-----------|-------------|------------|----------------|
+| SM4 ECB   | Block cipher | 78 MB/s    | 1.5x slower    |
+| SM4 CTR   | Streaming    | 77 MB/s    | N/A            |
+| SM3       | Hash         | 107 MB/s   | N/A            |
+| SM2 sign  | ECC          | 3.8 ms/op  | 6.4x slower    |
+| SM2 verify| ECC          | 5.5 ms/op  | 18.4x slower   |
+| SM9       | IBE          | 2-4 ms/op  | N/A            |
+| ZUC       | Stream cipher| 33 MB/s    | N/A            |
 
-**ECB Encryption:**
-
-| Size    | Julia (ms) | Julia (MB/s) | OpenSSL (ms) | OpenSSL (MB/s) | Ratio |
-|---------|-----------|-------------|-------------|----------------|-------|
-| 16 B    | 0.0005    | 32.0        | --          | --             | --    |
-| 1 KB    | 0.012     | 84.7        | 0.008       | 130.5          | 1.5x  |
-| 64 KB   | 0.748     | 85.6        | 0.488       | 131.3          | 1.5x  |
-| 1 MB    | 12.68     | 78.9        | 9.17        | 109.0          | 1.4x  |
-
-- **Key setup:** < 0.001 ms
-- SM4 Julia is only **1.4-1.5x slower** than OpenSSL's hand-optimized assembly
-
-### SM3 Hash (Pure Julia)
-
-| Size  | One-shot (ms) | One-shot (MB/s) | Stream (ms) | Stream (MB/s) |
-|-------|--------------|-----------------|-------------|---------------|
-| 16 B  | 0.0004       | 40.0            | 0.0006      | 26.7          |
-| 1 KB  | 0.012        | 81.3            | 0.014       | 73.9          |
-
-- Steady-state throughput: **~80 MB/s**
-
-### SM2 ECC Operations
-
-| Operation | Pure Julia | OpenSSL EVP | Ratio  |
-|-----------|-----------|-------------|--------|
-| keygen    | 2.106 ms  | 0.413 ms    | 5.1x   |
-| sign      | 2.166 ms  | 0.537 ms    | 4.0x   |
-| verify    | 4.816 ms  | 0.363 ms    | 13.3x  |
-| encrypt   | 5.448 ms  | 0.852 ms    | 6.4x   |
-| decrypt   | 2.649 ms  | 0.558 ms    | 4.7x   |
-
-### SM9 IBE Operations (Pure Julia only)
-
-| Operation          | Latency  |
-|--------------------|----------|
-| Master key gen     | 4.04 ms  |
-| User key extract   | 2.32 ms  |
-| G1 hash-to-point   | 3.79 ms  |
-| G1 scalar mult     | 3.70 ms  |
-| Param verification | 6.9 us   |
-
-### ZUC Stream Cipher (Pure Julia)
-
-| Size  | Encrypt (ms) | Encrypt (MB/s) |
-|-------|-------------|----------------|
-| 1 KB  | 0.027       | 37.0           |
-| 64 KB | 1.894       | 33.8           |
-| 100 KB| 2.557       | 39.1           |
+**Key takeaway:** SM4 pure Julia is only **1.4-1.6x slower** than OpenSSL assembly.
+See [benchmark details](doc/v0_1_0/BENCHMARK.md).
 
 ### Running Benchmarks
 
 ```bash
-# Pure Julia only (always works):
+# Pure Julia only:
 julia --project=. demo/benchmark/run_benchmarks.jl
 
 # Full comparison with OpenSSL:
 julia --project=. demo/benchmark/sm4_benchmark.jl
 julia --project=. demo/benchmark/sm2_benchmark.jl
-julia --project=. demo/benchmark/sm9_benchmark.jl
 ```
 
 ## Demos
