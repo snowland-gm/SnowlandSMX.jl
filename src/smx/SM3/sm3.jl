@@ -15,17 +15,20 @@ const IV = UInt32[0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
 
 const T_j = vcat(fill(UInt32(0x79cc4519), 16), fill(UInt32(0x7a879d8a), 48))
 
+# Precomputed T_j_rot[j] = rotate_left(T_j[j], j-1) for j=1..64
+# Eliminates one rotl per round in the compression function.
+const T_j_rot = let a = Vector{UInt32}(undef, 64)
+    for j in 1:64
+        a[j] = Base.bitrotate(T_j[j], j - 1)
+    end
+    a
+end
+
 # =============================================================================
 # Core SM3 Functions
 # =============================================================================
 
-function rotate_left(a::UInt32, k::Integer)
-    k = k % UInt32(32)
-    if k == 0
-        return a
-    end
-    return (a << k) | (a >> (32 - k))
-end
+rotate_left(a::UInt32, k::Integer) = Base.bitrotate(a, k)
 
 function P_0(X::UInt32)
     return X ⊻ rotate_left(X, 9) ⊻ rotate_left(X, 17)
@@ -56,41 +59,55 @@ function PUT_UINT32_BE(n::UInt32)
 end
 
 # =============================================================================
-# Message Expansion (inlined for performance)
+# Message Expansion (offset-based, in-place W buffer for zero allocation)
 # =============================================================================
 
-@inline function _msg_expand(block::Vector{UInt8})
-    W = Vector{UInt32}(undef, 68)
+@inline function _msg_expand!(W::Vector{UInt32}, block::Vector{UInt8}, off::Int)
     @inbounds for i in 0:15
-        off = i * 4
-        W[i + 1] = UInt32(block[off + 1]) << 24 |
-                   UInt32(block[off + 2]) << 16 |
-                   UInt32(block[off + 3]) << 8  |
-                   UInt32(block[off + 4])
+        bo = off + i * 4
+        W[i + 1] = UInt32(block[bo]) << 24 |
+                   UInt32(block[bo + 1]) << 16 |
+                   UInt32(block[bo + 2]) << 8  |
+                   UInt32(block[bo + 3])
     end
     @inbounds for i in 16:67
         W[i + 1] = P_1(W[i - 16 + 1] ⊻ W[i - 9 + 1] ⊻
                         rotate_left(W[i - 3 + 1], 15)) ⊻
                     rotate_left(W[i - 13 + 1], 7) ⊻ W[i - 6 + 1]
     end
+end
+
+@inline function _msg_expand(block::Vector{UInt8})
+    W = Vector{UInt32}(undef, 68)
+    _msg_expand!(W, block, 1)
     return W
 end
 
 # =============================================================================
-# SM3 Compression Function
+# SM3 Compression Function (in-place, no allocation)
+#
+# CF! modifies V in-place.  A separate W buffer (68 UInt32) is required.
+# The 64-round loop is split into 0:15 (XOR-only FF/GG) and 16:63
+# (AND-OR FF/GG) to eliminate branch prediction overhead.
+# T_j_rot precomputation eliminates one rotl per round.
 # =============================================================================
 
-function CF(V_i::Vector{UInt32}, B_i::Vector{UInt8})
-    W = _msg_expand(B_i)
+function CF!(V::Vector{UInt32}, block::Vector{UInt8}, off::Int, W::Vector{UInt32})
+    _msg_expand!(W, block, off)
 
-    A = V_i[1]; B = V_i[2]; C = V_i[3]; D = V_i[4]
-    E = V_i[5]; F = V_i[6]; G = V_i[7]; H = V_i[8]
+    # Save old IV values
+    V1 = V[1]; V2 = V[2]; V3 = V[3]; V4 = V[4]
+    V5 = V[5]; V6 = V[6]; V7 = V[7]; V8 = V[8]
 
-    @inbounds for j in 0:63
-        SS1 = rotate_left(rotate_left(A, 12) + E + rotate_left(T_j[j + 1], j), 7)
+    A = V1; B = V2; C = V3; D = V4
+    E = V5; F = V6; G = V7; H = V8
+
+    # Rounds 0-15: FF_j = XOR, GG_j = XOR
+    @inbounds for j in 0:15
+        SS1 = rotate_left(rotate_left(A, 12) + E + T_j_rot[j + 1], 7)
         SS2 = SS1 ⊻ rotate_left(A, 12)
-        TT1 = FF_j(A, B, C, j) + D + SS2 + (W[j + 1] ⊻ W[j + 4 + 1])
-        TT2 = GG_j(E, F, G, j) + H + SS1 + W[j + 1]
+        TT1 = (A ⊻ B ⊻ C) + D + SS2 + (W[j + 1] ⊻ W[j + 5])
+        TT2 = (E ⊻ F ⊻ G) + H + SS1 + W[j + 1]
 
         D = C
         C = rotate_left(B, 9)
@@ -102,8 +119,39 @@ function CF(V_i::Vector{UInt32}, B_i::Vector{UInt8})
         E = P_0(TT2)
     end
 
-    return UInt32[A ⊻ V_i[1], B ⊻ V_i[2], C ⊻ V_i[3], D ⊻ V_i[4],
-                  E ⊻ V_i[5], F ⊻ V_i[6], G ⊻ V_i[7], H ⊻ V_i[8]]
+    # Rounds 16-63: FF_j = majority, GG_j = choice
+    @inbounds for j in 16:63
+        SS1 = rotate_left(rotate_left(A, 12) + E + T_j_rot[j + 1], 7)
+        SS2 = SS1 ⊻ rotate_left(A, 12)
+        TT1 = ((A & B) | (A & C) | (B & C)) + D + SS2 + (W[j + 1] ⊻ W[j + 5])
+        TT2 = ((E & F) | ((~E) & G)) + H + SS1 + W[j + 1]
+
+        D = C
+        C = rotate_left(B, 9)
+        B = A
+        A = TT1
+        H = G
+        G = rotate_left(F, 19)
+        F = E
+        E = P_0(TT2)
+    end
+
+    V[1] = A ⊻ V1
+    V[2] = B ⊻ V2
+    V[3] = C ⊻ V3
+    V[4] = D ⊻ V4
+    V[5] = E ⊻ V5
+    V[6] = F ⊻ V6
+    V[7] = G ⊻ V7
+    V[8] = H ⊻ V8
+end
+
+# Backward-compatible wrapper (allocates, used by callers that expect a new V)
+function CF(V_i::Vector{UInt32}, B_i::Vector{UInt8})
+    V = copy(V_i)
+    W = Vector{UInt32}(undef, 68)
+    CF!(V, B_i, 1, W)
+    return V
 end
 
 # =============================================================================
@@ -196,8 +244,9 @@ end
 function _digest_bytes(msg::Vector{UInt8})
     padded = _pad(msg)
     V = copy(IV)
+    W = Vector{UInt32}(undef, 68)
     for i in 1:64:length(padded)
-        V = CF(V, padded[i:i+63])
+        CF!(V, padded, i, W)
     end
     return _v_to_bytes(V)
 end
@@ -239,13 +288,14 @@ mutable struct SM3Context
     iv::Vector{UInt32}
     block::Vector{UInt8}
     length::Int
+    w::Vector{UInt32}   # Reusable 68-UInt32 buffer for message expansion
 
     function SM3Context()
-        return new(copy(IV), UInt8[], 0)
+        return new(copy(IV), UInt8[], 0, Vector{UInt32}(undef, 68))
     end
 
     function SM3Context(data::Vector{UInt8})
-        ctx = new(copy(IV), UInt8[], 0)
+        ctx = new(copy(IV), UInt8[], 0, Vector{UInt32}(undef, 68))
         if !isempty(data)
             update!(ctx, data)
         end
@@ -253,7 +303,7 @@ mutable struct SM3Context
     end
 
     function SM3Context(data::AbstractString)
-        ctx = new(copy(IV), UInt8[], 0)
+        ctx = new(copy(IV), UInt8[], 0, Vector{UInt32}(undef, 68))
         if !isempty(data)
             update!(ctx, data)
         end
@@ -276,8 +326,8 @@ function _update_bytes!(ctx::SM3Context, data::Vector{UInt8})
 
     n_blocks = div(len_block, 64)
     idx = n_blocks * 64
-    for i in 1:64:idx
-        ctx.iv = CF(ctx.iv, ctx.block[i:i+63])
+    @inbounds for i in 1:64:idx
+        CF!(ctx.iv, ctx.block, i, ctx.w)
     end
     if idx + 1 <= len_block
         ctx.block = ctx.block[idx+1:end]
@@ -290,7 +340,7 @@ function digest!(ctx::SM3Context)
     padded = _pad_msg_for_context(ctx)
     len_block = length(padded)
     for i in 1:64:len_block
-        ctx.iv = CF(ctx.iv, padded[i:i+63])
+        CF!(ctx.iv, padded, i, ctx.w)
     end
 
     result = _v_to_bytes(ctx.iv)

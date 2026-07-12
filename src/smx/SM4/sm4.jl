@@ -4,15 +4,18 @@ module SM4
 # SM4 - Block Cipher  (GM/T 0002-2012)
 #
 # Performance optimizations:
-#   1. sm4_one_round uses scalar variables (zero per-round allocations)
-#   2. sm4_tau does inline S-box lookup on UInt32 bytes (no arrays)
-#   3. put_u32_be! writes directly into output buffer (no temp arrays)
-#   4. @inbounds on all hot loops
-#   5. Removed dead code in sm4_setkey!
+#   1. _sm4_round_u32 is the pure-UInt32 core (zero allocation, scalar registers)
+#   2. All block-level ops use UInt32 paths: _load_u32x4_be! / _encrypt_block_u32! / _store_u32x4_be!
+#   3. sm4_tau does inline S-box lookup on UInt32 bytes (no arrays)
+#   4. put_u32_be! writes directly into output buffer (no temp arrays)
+#   5. @inbounds on all hot loops
 # =============================================================================
 
 export Sm4, sm4_crypt_ecb, sm4_crypt_cbc,
        ENCRYPT, DECRYPT,
+       SM4_MODE_ECB, SM4_MODE_CBC, SM4_MODE_CFB, SM4_MODE_OFB, SM4_MODE_CTR,
+       SM4_PADDING_NONE, SM4_PADDING_PKCS7,
+       Sm4Stream, sm4_stream_update!, sm4_stream_final!,
        Sm4Ctr, Sm4Cbc, sm4_ctr_xor!, sm4_cbc_encrypt_update!,
        sm4_cbc_encrypt_final!, sm4_cbc_decrypt_update!,
        sm4_cbc_decrypt_final!
@@ -76,19 +79,47 @@ end
     end
 end
 
-@inline function _rotl(x::UInt32, n::Integer)::UInt32
-    return (x << n) | (x >> (32 - n))
-end
+@inline _rotl(x::UInt32, n::Integer)::UInt32 = Base.bitrotate(x, n)
 
 # =============================================================================
-# S-box: inline byte-level lookup on UInt32 (zero allocation)
+# Precomputed T-tables for SM4 round function
+#
+# Tj[x] = L(Sbox[x] at byte position j), where L is the linear transform
+# b ^ (b<<<2) ^ (b<<<10) ^ (b<<<18) ^ (b<<<24).
+#
+# This replaces 4 S-box lookups + 4 rotl + 4 XOR per round with
+# 4 T-table lookups + 3 XOR, saving ~128 rotl + 128 XOR per 16-byte block.
 # =============================================================================
+
+@inline function _sm4_make_L(b::UInt32)::UInt32
+    return b ⊻ Base.bitrotate(b, 2) ⊻ Base.bitrotate(b, 10) ⊻
+           Base.bitrotate(b, 18) ⊻ Base.bitrotate(b, 24)
+end
+
+const SM4_T0 = UInt32[_sm4_make_L(UInt32(SboxTable[i]) << 24) for i in 1:256]
+const SM4_T1 = UInt32[_sm4_make_L(UInt32(SboxTable[i]) << 16) for i in 1:256]
+const SM4_T2 = UInt32[_sm4_make_L(UInt32(SboxTable[i]) << 8)  for i in 1:256]
+const SM4_T3 = UInt32[_sm4_make_L(UInt32(SboxTable[i]))        for i in 1:256]
+
+# =============================================================================
+# S-box: inline byte-level lookup on UInt32 (zero allocation).
+# With T-tables: SM4_T0..T3 combine S-box + linear transform.
+# _sm4_tau is kept for key expansion where L differs (rotl 13,23 vs 2,10,18,24).
 
 @inline function _sm4_tau(ka::UInt32)::UInt32
     @inbounds return (UInt32(SboxTable[(ka >> 24) + 1]) << 24) |
                      (UInt32(SboxTable[((ka >> 16) & 0xff) + 1]) << 16) |
                      (UInt32(SboxTable[((ka >> 8)  & 0xff) + 1]) << 8)  |
                       UInt32(SboxTable[( ka        & 0xff) + 1])
+end
+
+# Core L-transform for encryption (using precomputed T-tables)
+# L(tau(x)) = T0[x_byte0] ^ T1[x_byte1] ^ T2[x_byte2] ^ T3[x_byte3]
+@inline function _sm4_lt(ka::UInt32)::UInt32
+    @inbounds return SM4_T0[(ka >> 24) + 1] ⊻
+                     SM4_T1[((ka >> 16) & 0xff) + 1] ⊻
+                     SM4_T2[((ka >> 8)  & 0xff) + 1] ⊻
+                     SM4_T3[(ka & 0xff) + 1]
 end
 
 # =============================================================================
@@ -98,11 +129,6 @@ end
 @inline function _sm4_calci_rk(ka::UInt32)::UInt32
     bb = _sm4_tau(ka)
     return bb ⊻ _rotl(bb, 13) ⊻ _rotl(bb, 23)
-end
-
-@inline function _sm4_lt(ka::UInt32)::UInt32
-    bb = _sm4_tau(ka)
-    return bb ⊻ _rotl(bb, 2) ⊻ _rotl(bb, 10) ⊻ _rotl(bb, 18) ⊻ _rotl(bb, 24)
 end
 
 @inline function _sm4_f(x0::UInt32, x1::UInt32, x2::UInt32, x3::UInt32, rk::UInt32)::UInt32
@@ -154,9 +180,7 @@ function sm4_setkey!(sm4::Sm4, key::Vector{UInt8}, mode::Int)
         item = item ⊻ k[i + 2]
     end
 
-    @inbounds for i in 1:32
-        sm4.sk[i] = k[i + 4]
-    end
+    copyto!(sm4.sk, 1, k, 5, 32)
     sm4.mode = mode
 
     if mode == DECRYPT
@@ -165,89 +189,111 @@ function sm4_setkey!(sm4::Sm4, key::Vector{UInt8}, mode::Int)
 end
 
 """
-    sm4_one_round(sm4::Sm4, input::Vector{UInt8}, in_off::Int,
-                  output::Vector{UInt8}, out_off::Int)
+    _sm4_round_u32(sk::Vector{UInt32}, x1::UInt32, x2::UInt32,
+                   x3::UInt32, x4::UInt32) -> NTuple{4, UInt32}
 
-Process one 16-byte block. Uses scalar variables for zero allocation in the
-inner loop.
+Pure-UInt32 SM4 core: runs 32 rounds in scalar registers.
+Returns the 4-word final state (x1, x2, x3, x4).
+Caller packs in reverse for SM4 output order (x4, x3, x2, x1).
 """
-function sm4_one_round(sm4::Sm4, input::Vector{UInt8}, in_off::Int,
-                        output::Vector{UInt8}, out_off::Int)
-    x1 = _get_u32_be(input, in_off)
-    x2 = _get_u32_be(input, in_off + 4)
-    x3 = _get_u32_be(input, in_off + 8)
-    x4 = _get_u32_be(input, in_off + 12)
-
-    sk = sm4.sk
+@inline function _sm4_round_u32(sk::Vector{UInt32}, x1::UInt32, x2::UInt32,
+                                 x3::UInt32, x4::UInt32)
     @inbounds for rk in sk
         tmp = _sm4_f(x1, x2, x3, x4, rk)
         x1, x2, x3, x4 = x2, x3, x4, tmp
     end
-
-    # Output in reverse: x4, x3, x2, x1
-    _put_u32_be!(output, out_off,      x4)
-    _put_u32_be!(output, out_off + 4,  x3)
-    _put_u32_be!(output, out_off + 8,  x2)
-    _put_u32_be!(output, out_off + 12, x1)
+    return (x1, x2, x3, x4)
 end
 
 # =============================================================================
-# ECB Mode
+# Streaming API (Sm4Stream, helpers) - included inline for visibility
+# =============================================================================
+include("sm4_stream.jl")
+
+# =============================================================================
+# ECB Mode (UInt32 path: load → encrypt → store)
 # =============================================================================
 
 """
     sm4_crypt_ecb!(sm4::Sm4, input_data::Vector{UInt8}) -> Vector{UInt8}
 
 SM4-ECB mode encryption/decryption.  Pre-allocates output buffer.
+Uses the UInt32 native path: load 4 words, encrypt, store 4 words.
 """
 function sm4_crypt_ecb!(sm4::Sm4, input_data::Vector{UInt8})
     n = length(input_data)
     output_data = Vector{UInt8}(undef, n)
-    @inbounds for i in 0:16:n-1
-        sm4_one_round(sm4, input_data, i + 1, output_data, i + 1)
+    n_blocks = n >> 4
+    blk_u32 = Vector{UInt32}(undef, 4)
+    out_u32 = Vector{UInt32}(undef, 4)
+    @inbounds for b in 0:n_blocks-1
+        byte_off = (b << 4) + 1
+        _load_u32x4_be!(blk_u32, input_data, byte_off)
+        _sm4_encrypt_block_u32!(sm4.sk, blk_u32, 1, out_u32, 1)
+        _store_u32x4_be!(output_data, byte_off, out_u32)
     end
     return output_data
 end
 
 # =============================================================================
-# CBC Mode
+# CBC Mode (UInt32 path: load → XOR in UInt32 → encrypt → store)
 # =============================================================================
 
 """
     sm4_crypt_cbc!(sm4::Sm4, iv::Vector{UInt8}, input_data::Vector{UInt8}) -> Vector{UInt8}
 
 SM4-CBC mode encryption/decryption.
+Uses the UInt32 native path: load chain+block as UInt32, XOR/encrypt/store.
 """
 function sm4_crypt_cbc!(sm4::Sm4, iv::Vector{UInt8}, input_data::Vector{UInt8})
     n = length(input_data)
     n_blocks = n >> 4
     output_data = Vector{UInt8}(undef, n)
 
+    chain_u32 = Vector{UInt32}(undef, 4)
+    _load_u32x4_be!(chain_u32, iv, 1)
+    blk_u32 = Vector{UInt32}(undef, 4)
+    dec_u32 = Vector{UInt32}(undef, 4)
+
     if sm4.mode == ENCRYPT
-        prev = copy(iv)
-        xored = Vector{UInt8}(undef, 16)
         @inbounds for b in 0:n_blocks-1
-            off = b << 4
-            for j in 1:16
-                xored[j] = prev[j] ⊻ input_data[off + j]
-            end
-            sm4_one_round(sm4, xored, 1, output_data, off + 1)
-            for j in 1:16
-                prev[j] = output_data[off + j]
-            end
+            byte_off = (b << 4) + 1
+
+            # Load plaintext block, XOR with chain in UInt32
+            _load_u32x4_be!(blk_u32, input_data, byte_off)
+            blk_u32[1] ⊻= chain_u32[1]
+            blk_u32[2] ⊻= chain_u32[2]
+            blk_u32[3] ⊻= chain_u32[3]
+            blk_u32[4] ⊻= chain_u32[4]
+
+            # Encrypt; ciphertext becomes next chain (write directly into chain_u32)
+            _sm4_encrypt_block_u32!(sm4.sk, blk_u32, 1, chain_u32, 1)
+
+            # Write ciphertext
+            _store_u32x4_be!(output_data, byte_off, chain_u32)
         end
     else  # DECRYPT
-        prev = copy(iv)
-        block = Vector{UInt8}(undef, 16)
         @inbounds for b in 0:n_blocks-1
-            off = b << 4
-            sm4_one_round(sm4, input_data, off + 1, block, 1)
-            for j in 1:16
-                output_data[off + j] = prev[j] ⊻ block[j]
-            end
-            for j in 1:16
-                prev[j] = input_data[off + j]
-            end
+            byte_off = (b << 4) + 1
+
+            # Load ciphertext block
+            _load_u32x4_be!(blk_u32, input_data, byte_off)
+
+            # Decrypt (reversed key schedule)
+            _sm4_encrypt_block_u32!(sm4.sk, blk_u32, 1, dec_u32, 1)
+
+            # XOR with chain and write plaintext
+            dec_u32[1] ⊻= chain_u32[1]
+            dec_u32[2] ⊻= chain_u32[2]
+            dec_u32[3] ⊻= chain_u32[3]
+            dec_u32[4] ⊻= chain_u32[4]
+            _store_u32x4_be!(output_data, byte_off, dec_u32)
+
+            # New chain = current ciphertext block
+            chain_u32[1] = blk_u32[1]
+            chain_u32[2] = blk_u32[2]
+            chain_u32[3] = blk_u32[3]
+            chain_u32[4] = blk_u32[4]
         end
     end
 
@@ -268,382 +314,6 @@ function sm4_crypt_cbc(mode::Int, key::Vector{UInt8}, iv::Vector{UInt8}, data::V
     sm4 = Sm4()
     sm4_setkey!(sm4, key, mode)
     return sm4_crypt_cbc!(sm4, iv, data)
-end
-
-# =============================================================================
-# SM4 Streaming API
-#
-# Motivation: sm4_crypt_ecb! and sm4_crypt_cbc! allocate a full output
-# buffer (Vector{UInt8}(undef, n)) and copy IV/chain state.  For large
-# data (e.g. 100+ MB) this causes GC pressure and frequent major collections.
-#
-# The streaming API solves this:
-#   1. CTR mode - no buffering, output length = input length, no padding.
-#   2. CBC mode - 16-byte internal buffer, PKCS7 padding on finalize.
-#      User provides pre-allocated output; only internal scratch is
-#      allocated once at construction time.
-#
-# Usage:
-#   # CTR (simplest, recommended for large streams)
-#   ctx = Sm4Ctr(key, iv)
-#   out = Vector{UInt8}(undef, 4096)
-#   for chunk in reader
-#       sm4_ctr_xor!(ctx, chunk, out)
-#       write(writer, view(out, 1:length(chunk)))
-#   end
-#
-#   # CBC encrypt (streaming)
-#   ctx = Sm4Cbc(key, iv, ENCRYPT)
-#   out = similar(input)
-#   n = sm4_cbc_encrypt_update!(ctx, input, out)
-#   rem = sm4_cbc_encrypt_final!(ctx, out, n)
-#   total_out = view(out, 1:n + rem)
-#
-#   # CBC decrypt (streaming)
-#   ctx = Sm4Cbc(key, iv, DECRYPT)
-#   out = similar(input)
-#   n = sm4_cbc_decrypt_update!(ctx, input, out)
-#   rem = sm4_cbc_decrypt_final!(ctx, out, n)
-#   total_out = view(out, 1:n + rem)
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# Standalone block encrypt (operates on plain sk::Vector{UInt32})
-# -----------------------------------------------------------------------------
-@inline function _sm4_encrypt_block!(sk::Vector{UInt32}, input::AbstractVector{UInt8},
-                                      in_off::Int, output::AbstractVector{UInt8},
-                                      out_off::Int)
-    x1 = _get_u32_be(input, in_off)
-    x2 = _get_u32_be(input, in_off + 4)
-    x3 = _get_u32_be(input, in_off + 8)
-    x4 = _get_u32_be(input, in_off + 12)
-
-    @inbounds for rk in sk
-        tmp = _sm4_f(x1, x2, x3, x4, rk)
-        x1, x2, x3, x4 = x2, x3, x4, tmp
-    end
-
-    _put_u32_be!(output, out_off,      x4)
-    _put_u32_be!(output, out_off + 4,  x3)
-    _put_u32_be!(output, out_off + 8,  x2)
-    _put_u32_be!(output, out_off + 12, x1)
-end
-
-@inline function _sm4_set_encrypt_key!(sk::Vector{UInt32}, key::Vector{UInt8})
-    MK1 = _get_u32_be(key, 1)
-    MK2 = _get_u32_be(key, 5)
-    MK3 = _get_u32_be(key, 9)
-    MK4 = _get_u32_be(key, 13)
-
-    k = Vector{UInt32}(undef, 36)
-    @inbounds begin
-        k[1] = MK1 ⊻ FK[1]
-        k[2] = MK2 ⊻ FK[2]
-        k[3] = MK3 ⊻ FK[3]
-        k[4] = MK4 ⊻ FK[4]
-    end
-
-    item = k[2] ⊻ k[3]
-    @inbounds for i in 0:31
-        item = item ⊻ k[i + 4]
-        k[i + 5] = k[i + 1] ⊻ _sm4_calci_rk(item ⊻ CK[i + 1])
-        item = item ⊻ k[i + 2]
-    end
-
-    @inbounds for i in 1:32
-        sk[i] = k[i + 4]
-    end
-    return nothing
-end
-
-# =============================================================================
-# CTR Mode - most efficient streaming mode
-# =============================================================================
-
-"""
-    Sm4Ctr
-
-CTR-mode streaming context.  Pre-allocates all internal buffers once.
-CTR uses only the encrypt direction; encryption and decryption are
-identical (XOR with keystream).
-
-# Fields
-- `sk::Vector{UInt32}`: 32 expanded round keys (ENCRYPT direction)
-- `ctr::Vector{UInt8}`: 16-byte counter block
-- `kstream::Vector{UInt8}`: 16-byte encrypted counter (keystream chunk)
-- `kpos::Int`: current byte offset within kstream (1-based, 17 = need new block)
-"""
-mutable struct Sm4Ctr
-    sk::Vector{UInt32}
-    ctr::Vector{UInt8}
-    kstream::Vector{UInt8}
-    kpos::Int
-
-    function Sm4Ctr(key::Vector{UInt8}, iv::Vector{UInt8})
-        length(iv) == 16 || error("IV must be 16 bytes, got $(length(iv))")
-        ctx = new(zeros(UInt32, 32), zeros(UInt8, 16), zeros(UInt8, 16), 17)
-        _sm4_set_encrypt_key!(ctx.sk, key)
-        copyto!(ctx.ctr, iv)
-        return ctx
-    end
-end
-
-"""
-    sm4_ctr_xor!(ctx::Sm4Ctr, input::Vector{UInt8}, output::Vector{UInt8})
-
-CTR-mode XOR.  Encrypts or decrypts `input` into `output`.
-`output` must be at least `length(input)` bytes.
-Returns number of bytes processed (= length(input)).
-
-No padding needed — output length always equals input length.
-"""
-function sm4_ctr_xor!(ctx::Sm4Ctr, input::AbstractVector{UInt8}, output::AbstractVector{UInt8})
-    n = length(input)
-    @inbounds for i in 1:n
-        if ctx.kpos >= 17
-            _sm4_encrypt_block!(ctx.sk, ctx.ctr, 1, ctx.kstream, 1)
-            ctx.kpos = 1
-            # Increment counter (big-endian)
-            for j in 16:-1:1
-                ctx.ctr[j] += 0x01
-                ctx.ctr[j] != 0x00 && break
-            end
-        end
-        output[i] = input[i] ⊻ ctx.kstream[ctx.kpos]
-        ctx.kpos += 1
-    end
-    return n
-end
-
-# =============================================================================
-# CBC Mode - streaming with PKCS7 padding
-# =============================================================================
-
-"""
-    Sm4Cbc
-
-CBC-mode streaming context.  Maintains chain state and a 16-byte
-overflow buffer for partial blocks.
-
-# Fields
-- `sk::Vector{UInt32}`: 32 expanded round keys
-- `chain::Vector{UInt8}`: 16-byte chaining block (IV updated to last CT)
-- `buffer::Vector{UInt8}`: 16-byte overflow buffer
-- `buf_len::Int`: bytes accumulated in buffer (0..15)
-- `mode::Int`: ENCRYPT or DECRYPT
-"""
-mutable struct Sm4Cbc
-    sk::Vector{UInt32}
-    chain::Vector{UInt8}
-    buffer::Vector{UInt8}
-    buf_len::Int
-    mode::Int
-
-    function Sm4Cbc(key::Vector{UInt8}, iv::Vector{UInt8}, mode::Int)
-        length(iv) == 16 || error("IV must be 16 bytes, got $(length(iv))")
-        ctx = new(zeros(UInt32, 32), zeros(UInt8, 16),
-                  zeros(UInt8, 16), 0, mode)
-        if mode == ENCRYPT
-            _sm4_set_encrypt_key!(ctx.sk, key)
-        elseif mode == DECRYPT
-            _sm4_set_encrypt_key!(ctx.sk, key)
-            reverse!(ctx.sk)  # decrypt = encrypt with reversed round keys
-        else
-            error("Invalid mode: $mode, expected ENCRYPT(0) or DECRYPT(1)")
-        end
-        copyto!(ctx.chain, iv)
-        return ctx
-    end
-end
-
-# -----------------------------------------------------------------------------
-# CBC Encrypt streaming
-# -----------------------------------------------------------------------------
-
-"""
-    sm4_cbc_encrypt_update!(ctx::Sm4Cbc, input::Vector{UInt8}, output::Vector{UInt8}) -> Int
-
-Feed `input` into the CBC encrypt stream.  Returns the number of bytes
-written to `output` (always a multiple of 16).  Any partial block
-(< 16 bytes) is buffered internally.
-
-`output` must have space for `floor((ctx.buf_len + length(input)) / 16) * 16` bytes.
-"""
-function sm4_cbc_encrypt_update!(ctx::Sm4Cbc, input::AbstractVector{UInt8},
-                                  output::AbstractVector{UInt8})
-    n_in = length(input)
-    out_off = 1
-
-    # If we have buffered bytes from a previous call, try to fill a block
-    if ctx.buf_len > 0
-        needed = 16 - ctx.buf_len
-        take = min(needed, n_in)
-        @inbounds for i in 1:take
-            ctx.buffer[ctx.buf_len + i] = input[i]
-        end
-        ctx.buf_len += take
-
-        if ctx.buf_len == 16
-            # Full block: XOR with chain, encrypt, update chain
-            @inbounds for j in 1:16
-                ctx.buffer[j] ⊻= ctx.chain[j]
-            end
-            _sm4_encrypt_block!(ctx.sk, ctx.buffer, 1, output, out_off)
-            @inbounds copyto!(ctx.chain, 1, output, out_off, 16)
-            out_off += 16
-            ctx.buf_len = 0
-        end
-        # Process remaining input aligned from position take+1
-        pos = take + 1
-    else
-        pos = 1
-    end
-
-    # Process full blocks
-    n_full = (n_in - pos + 1) >> 4
-    @inbounds for b in 0:n_full-1
-        ioff = pos + (b << 4)
-        ooff = out_off + (b << 4)
-        # XOR with chain
-        for j in 1:16
-            output[ooff + j - 1] = ctx.chain[j] ⊻ input[ioff + j - 1]
-        end
-        _sm4_encrypt_block!(ctx.sk, output, ooff, output, ooff)
-        copyto!(ctx.chain, 1, output, ooff, 16)
-    end
-    out_off += n_full << 4
-
-    # Buffer remaining bytes
-    remaining = n_in - pos - (n_full << 4) + 1
-    if remaining > 0
-        start = pos + (n_full << 4)
-        @inbounds for i in 1:remaining
-            ctx.buffer[i] = input[start + i - 1]
-        end
-        ctx.buf_len = remaining
-    end
-
-    return out_off - 1
-end
-
-"""
-    sm4_cbc_encrypt_final!(ctx::Sm4Cbc, output::Vector{UInt8}, offset::Int) -> Int
-
-Finalize CBC encryption.  Applies PKCS7 padding, encrypts the final
-block(s), and writes to `output` starting at position `offset`.
-Returns the number of bytes written (16 or possibly 32).
-
-After calling finalize, the context should not be reused.
-"""
-function sm4_cbc_encrypt_final!(ctx::Sm4Cbc, output::AbstractVector{UInt8},
-                                 offset::Int=1)
-    pad_val = UInt8(16 - ctx.buf_len)
-    @inbounds for i in (ctx.buf_len + 1):16
-        ctx.buffer[i] = pad_val
-    end
-
-    # XOR last block with chain, encrypt
-    @inbounds for j in 1:16
-        ctx.buffer[j] ⊻= ctx.chain[j]
-    end
-    _sm4_encrypt_block!(ctx.sk, ctx.buffer, 1, output, offset)
-    return 16
-end
-
-# -----------------------------------------------------------------------------
-# CBC Decrypt streaming
-# -----------------------------------------------------------------------------
-
-"""
-    sm4_cbc_decrypt_update!(ctx::Sm4Cbc, input::AbstractVector{UInt8},
-                            output::AbstractVector{UInt8}) -> Int
-
-Feed ciphertext into the CBC decrypt stream.  Returns bytes written to
-`output`.  At least 2 full blocks (32 bytes) must be accumulated before
-any output is produced, because the last block is always held back for
-PKCS7 padding removal in `final!`.
-
-`output` must have space for `max(0, floor((ctx.buf_len + length(input)) / 16) - 1) * 16` bytes.
-"""
-function sm4_cbc_decrypt_update!(ctx::Sm4Cbc, input::AbstractVector{UInt8},
-                                  output::AbstractVector{UInt8})
-    n_in = length(input)
-
-    # Ensure buffer capacity (buf_len can grow beyond 16; resize rarely)
-    if ctx.buf_len + n_in > length(ctx.buffer)
-        resize!(ctx.buffer, max(length(ctx.buffer) * 2, ctx.buf_len + n_in + 32))
-    end
-
-    # Append input to buffer
-    @inbounds for i in 1:n_in
-        ctx.buffer[ctx.buf_len + i] = input[i]
-    end
-    ctx.buf_len += n_in
-
-    # Output all complete blocks except the last one
-    blocks_total = ctx.buf_len >> 4
-    if blocks_total < 2
-        return 0
-    end
-
-    blocks_out = blocks_total - 1
-    tmp = Vector{UInt8}(undef, 16)
-    for b in 0:blocks_out-1
-        ioff = (b << 4) + 1
-        ooff = (b << 4) + 1
-        _sm4_encrypt_block!(ctx.sk, ctx.buffer, ioff, tmp, 1)
-        @inbounds for j in 1:16
-            output[ooff + j - 1] = ctx.chain[j] ⊻ tmp[j]
-        end
-        copyto!(ctx.chain, 1, ctx.buffer, ioff, 16)
-    end
-
-    # Shift remaining data (last block + any partial) to front of buffer
-    consumed = blocks_out << 4
-    remaining = ctx.buf_len - consumed
-    @inbounds for i in 1:remaining
-        ctx.buffer[i] = ctx.buffer[consumed + i]
-    end
-    ctx.buf_len = remaining
-
-    return blocks_out << 4
-end
-
-"""
-    sm4_cbc_decrypt_final!(ctx::Sm4Cbc, output::AbstractVector{UInt8},
-                           offset::Int=1) -> Int
-
-Finalize CBC decryption.  Decrypts the last buffered block, removes
-PKCS7 padding, and writes plaintext to `output` starting at `offset`.
-Returns the number of plaintext bytes written.
-
-Errors on invalid padding.
-"""
-function sm4_cbc_decrypt_final!(ctx::Sm4Cbc, output::AbstractVector{UInt8},
-                                 offset::Int=1)
-    # Must have exactly one block remaining
-    ctx.buf_len == 16 || error(
-        "CBC decrypt finalize: expected 16 buffered bytes, got $(ctx.buf_len)")
-
-    tmp = Vector{UInt8}(undef, 16)
-    _sm4_encrypt_block!(ctx.sk, ctx.buffer, 1, tmp, 1)
-    @inbounds for j in 1:16
-        output[offset + j - 1] = ctx.chain[j] ⊻ tmp[j]
-    end
-
-    # Remove PKCS7 padding
-    pad_len = output[offset + 15]
-    if pad_len < 1 || pad_len > 16
-        error("CBC decrypt finalize: invalid PKCS7 padding value $pad_len")
-    end
-    @inbounds for k in 1:pad_len
-        if output[offset + 16 - k] != pad_len
-            error("CBC decrypt finalize: PKCS7 padding mismatch at position $k")
-        end
-    end
-
-    ctx.buf_len = 0
-    return 16 - Int(pad_len)
 end
 
 end # module SM4

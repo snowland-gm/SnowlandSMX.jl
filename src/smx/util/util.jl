@@ -51,6 +51,22 @@ function _bigint_to_hex(x::BigInt, len::Int)
 end
 
 """
+    _bigint_to_bytes(x::BigInt, nbytes::Int) -> Vector{UInt8}
+
+Convert a BigInt to a big-endian byte vector of length nbytes.
+No hex intermediate -- directly extracts bytes from the integer.
+"""
+function _bigint_to_bytes(x::BigInt, nbytes::Int)
+    result = Vector{UInt8}(undef, nbytes)
+    v = x
+    @inbounds for i in nbytes:-1:1
+        result[i] = UInt8(v & 0xff)
+        v >>= 8
+    end
+    return result
+end
+
+"""
     _rand_bytes(n::Int) -> Vector{UInt8}
 
 Generate n bytes of cryptographically secure random data.
@@ -65,12 +81,26 @@ function _rand_bytes(n::Int)
 end
 
 """
+    _bytes_to_bigint(b::Vector{UInt8}) -> BigInt
+
+Convert a big-endian byte vector to a BigInt directly.
+No hex intermediate -- O(n) byte shifts.
+"""
+function _bytes_to_bigint(b::Vector{UInt8})::BigInt
+    result = BigInt(0)
+    @inbounds for byte in b
+        result = (result << 8) | byte
+    end
+    return result
+end
+
+"""
     _rand_bigint(n_bytes::Int) -> BigInt
 
 Generate a random BigInt from n_bytes of secure random data.
 """
 function _rand_bigint(n_bytes::Int)
-    return parse(BigInt, _bytes2hex(_rand_bytes(n_bytes)), base=16)
+    return _bytes_to_bigint(_rand_bytes(n_bytes))
 end
 
 """

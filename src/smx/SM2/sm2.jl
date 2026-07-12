@@ -54,6 +54,13 @@ const COORD_BYTES = 32
 const POINT_BYTES  = 64
 const HEX_LEN      = 64
 
+# Precomputed byte representations of SM2 curve constants (avoids repeated
+# BigInt→hex→bytes conversion in sm2_compute_za on every sign/verify call).
+const _sm2_a_bytes  = _hex2bytes(sm2_a_hex)
+const _sm2_b_bytes  = _hex2bytes(sm2_b_hex)
+const _sm2_Gx_bytes = _hex2bytes(sm2_Gx_hex)
+const _sm2_Gy_bytes = _hex2bytes(sm2_Gy_hex)
+
 # =============================================================================
 # Secure Random BigInt
 # =============================================================================
@@ -61,7 +68,7 @@ const HEX_LEN      = 64
 function _sm2_rand_bigint()
     while true
         d_bytes = _rand_bytes(32)
-        d = parse(BigInt, _bytes2hex(d_bytes), base=16)
+        d = _bytes_to_bigint(d_bytes)
         if 0 < d < sm2_N
             return d
         end
@@ -123,18 +130,18 @@ function sm2_compute_za(id::AbstractString, pubkey::Vector{UInt8})
     id_bytes = Vector{UInt8}(id)
     entl = UInt16(length(id_bytes) * 8)
 
-    a_bytes  = _hex2bytes(_bigint_to_hex(sm2_a, HEX_LEN))
-    b_bytes  = _hex2bytes(_bigint_to_hex(sm2_b, HEX_LEN))
-    xG_bytes = _hex2bytes(_bigint_to_hex(sm2_Gx, HEX_LEN))
-    yG_bytes = _hex2bytes(_bigint_to_hex(sm2_Gy, HEX_LEN))
+    # Preallocated buffer: 2 (ENTL) + |id| + 4*32 (a,b,xG,yG) + 64 (pubkey)
+    za_input = Vector{UInt8}(undef, 2 + length(id_bytes) + 4 * COORD_BYTES + POINT_BYTES)
+    off = 1
+    za_input[off] = (entl >> 8) & 0xff; off += 1
+    za_input[off] = entl & 0xff;        off += 1
+    copyto!(za_input, off, id_bytes, 1, length(id_bytes)); off += length(id_bytes)
+    copyto!(za_input, off, _sm2_a_bytes,  1, COORD_BYTES); off += COORD_BYTES
+    copyto!(za_input, off, _sm2_b_bytes,  1, COORD_BYTES); off += COORD_BYTES
+    copyto!(za_input, off, _sm2_Gx_bytes, 1, COORD_BYTES); off += COORD_BYTES
+    copyto!(za_input, off, _sm2_Gy_bytes, 1, COORD_BYTES); off += COORD_BYTES
+    copyto!(za_input, off, pubkey,        1, POINT_BYTES)
 
-    za_input = vcat(
-        UInt8[(entl >> 8) & 0xff, entl & 0xff],
-        id_bytes,
-        a_bytes, b_bytes,
-        xG_bytes, yG_bytes,
-        pubkey
-    )
     return sm3_digest(za_input)
 end
 
@@ -205,13 +212,13 @@ function sm2_sign(message, DA::AbstractString, K::AbstractString;
         else
             msg_bytes = Vector{UInt8}(string(message))
         end
-        e = parse(BigInt, _bytes2hex(msg_bytes), base=16)
+        e = _bytes_to_bigint(msg_bytes)
     end
     return _sm2_sign_impl_e(e, DA, K)
 end
 
 function _sm2_sign_impl(m_hash::Vector{UInt8}, DA::AbstractString)
-    e = parse(BigInt, _bytes2hex(m_hash), base=16)
+    e = _bytes_to_bigint(m_hash)
     d = parse(BigInt, DA, base=16)
     return _sm2_sign_impl_e(e, d)
 end
@@ -235,8 +242,19 @@ function _sm2_sign_impl_e(e::BigInt, DA::Union{AbstractString, BigInt})
             continue
         end
 
-        return _hex2bytes(string(R, base=16, pad=HEX_LEN) *
-                          string(S, base=16, pad=HEX_LEN))
+        # Write R || S directly as bytes (skip hex string construction)
+        result = Vector{UInt8}(undef, POINT_BYTES)
+        v = R
+        @inbounds for i in COORD_BYTES:-1:1
+            result[i] = UInt8(v & 0xff)
+            v >>= 8
+        end
+        v = S
+        @inbounds for i in COORD_BYTES:-1:1
+            result[COORD_BYTES + i] = UInt8(v & 0xff)
+            v >>= 8
+        end
+        return result
     end
 end
 
@@ -258,8 +276,19 @@ function _sm2_sign_impl_e(e::BigInt, DA::AbstractString, K::AbstractString)
         return UInt8[]
     end
 
-    return _hex2bytes(string(R, base=16, pad=HEX_LEN) *
-                      string(S, base=16, pad=HEX_LEN))
+    # Write R || S directly as bytes (skip hex string construction)
+    result = Vector{UInt8}(undef, POINT_BYTES)
+    v = R
+    @inbounds for i in COORD_BYTES:-1:1
+        result[i] = UInt8(v & 0xff)
+        v >>= 8
+    end
+    v = S
+    @inbounds for i in COORD_BYTES:-1:1
+        result[COORD_BYTES + i] = UInt8(v & 0xff)
+        v >>= 8
+    end
+    return result
 end
 
 # =============================================================================
@@ -285,9 +314,8 @@ function sm2_verify(Sign::Vector{UInt8}, message, id::AbstractString,
 end
 
 function sm2_verify(Sign::Vector{UInt8}, E, PA; Hexstr::Bool=false)
-    sign_hex = _bytes2hex(Sign)
-    r = parse(BigInt, sign_hex[1:HEX_LEN], base=16)
-    s = parse(BigInt, sign_hex[HEX_LEN + 1:2 * HEX_LEN], base=16)
+    r = _bytes_to_bigint(Sign[1:COORD_BYTES])
+    s = _bytes_to_bigint(Sign[COORD_BYTES + 1:POINT_BYTES])
 
     if Hexstr
         e = parse(BigInt, E, base=16)
@@ -299,7 +327,7 @@ function sm2_verify(Sign::Vector{UInt8}, E, PA; Hexstr::Bool=false)
         else
             E_bytes = Vector{UInt8}(string(E))
         end
-        e = parse(BigInt, _bytes2hex(E_bytes), base=16)
+        e = _bytes_to_bigint(E_bytes)
     end
 
     return _sm2_verify_core(r, s, e, PA)
@@ -307,18 +335,17 @@ end
 
 function _sm2_verify_impl(Sign::Vector{UInt8}, m_hash::Vector{UInt8},
                            PA::Vector{UInt8})
-    sign_hex = _bytes2hex(Sign)
-    r = parse(BigInt, sign_hex[1:HEX_LEN], base=16)
-    s = parse(BigInt, sign_hex[HEX_LEN + 1:2 * HEX_LEN], base=16)
-    e = parse(BigInt, _bytes2hex(m_hash), base=16)
+    r = _bytes_to_bigint(Sign[1:COORD_BYTES])
+    s = _bytes_to_bigint(Sign[COORD_BYTES + 1:POINT_BYTES])
+    e = _bytes_to_bigint(m_hash)
     return _sm2_verify_core(r, s, e, PA)
 end
 
 function _sm2_verify_core(r::BigInt, s::BigInt, e::BigInt, PA::Union{Vector{UInt8}, AbstractString})
-    if PA isa Vector{UInt8}
-        pa_hex = _bytes2hex(PA)
+    PA_point = if PA isa Vector{UInt8}
+        _point_from_bytes(PA)
     elseif PA isa AbstractString
-        pa_hex = PA
+        _point_from_hex(PA)
     else
         error("PA must be a string or bytes")
     end
@@ -329,7 +356,7 @@ function _sm2_verify_core(r::BigInt, s::BigInt, e::BigInt, PA::Union{Vector{UInt
     end
 
     P1 = s * sm2_G
-    P2 = t * _point_from_hex(pa_hex)
+    P2 = t * PA_point
     P_result = P1 + P2
 
     x = _point_x(P_result)
@@ -406,17 +433,26 @@ function sm2_encrypt(message, PA; format::Symbol=:C1C3C2, Hexstr::Bool=false)
     end
 
     # C3 = SM3(x2 || M || y2)
-    x2_bytes = xy_bytes[1:COORD_BYTES]
-    y2_bytes = xy_bytes[COORD_BYTES + 1:POINT_BYTES]
-    C3 = sm3_digest(vcat(x2_bytes, msg, y2_bytes))
+    c3_input = Vector{UInt8}(undef, COORD_BYTES + ml + COORD_BYTES)
+    copyto!(c3_input, 1, xy_bytes, 1, COORD_BYTES)
+    copyto!(c3_input, COORD_BYTES + 1, msg, 1, ml)
+    copyto!(c3_input, COORD_BYTES + ml + 1, xy_bytes, COORD_BYTES + 1, COORD_BYTES)
+    C3 = sm3_digest(c3_input)
 
+    # Assemble ciphertext: C1 || C3 || C2 (or C1 || C2 || C3)
+    total_len = POINT_BYTES + 32 + ml
+    result = Vector{UInt8}(undef, total_len)
+    copyto!(result, 1, C1, 1, POINT_BYTES)
     if format == :C1C3C2
-        return vcat(C1, C3, C2)
+        copyto!(result, POINT_BYTES + 1, C3, 1, 32)
+        copyto!(result, POINT_BYTES + 33, C2, 1, ml)
     elseif format == :C1C2C3
-        return vcat(C1, C2, C3)
+        copyto!(result, POINT_BYTES + 1, C2, 1, ml)
+        copyto!(result, POINT_BYTES + ml + 1, C3, 1, 32)
     else
         error("Unknown ciphertext format: $format. Use :C1C3C2 or :C1C2C3")
     end
+    return result
 end
 
 # =============================================================================
@@ -485,9 +521,11 @@ function sm2_decrypt(C::Vector{UInt8}, DA::AbstractString; format::Symbol=:C1C3C
     end
 
     # Verify: u = SM3(x2 || M || y2) ?= C3
-    x2_bytes = xy_bytes[1:COORD_BYTES]
-    y2_bytes = xy_bytes[COORD_BYTES + 1:POINT_BYTES]
-    u = sm3_digest(vcat(x2_bytes, M, y2_bytes))
+    c3_input = Vector{UInt8}(undef, COORD_BYTES + cl + COORD_BYTES)
+    copyto!(c3_input, 1, xy_bytes, 1, COORD_BYTES)
+    copyto!(c3_input, COORD_BYTES + 1, M, 1, cl)
+    copyto!(c3_input, COORD_BYTES + cl + 1, xy_bytes, COORD_BYTES + 1, COORD_BYTES)
+    u = sm3_digest(c3_input)
 
     if u == C3
         return M

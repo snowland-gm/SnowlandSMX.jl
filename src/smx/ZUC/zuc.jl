@@ -116,9 +116,7 @@ end
     return ((a << shift) | (a >> (31 - shift))) & 0x7FFFFFFF
 end
 
-@inline function _rotl_uint32(a::UInt32, shift::Integer)::UInt32
-    return (a << shift) | (a >> (32 - shift))
-end
+@inline _rotl_uint32(a::UInt32, shift::Integer)::UInt32 = Base.bitrotate(a, shift)
 
 @inline function _l1(x::UInt32)::UInt32
     return x ⊻ _rotl_uint32(x, 2) ⊻ _rotl_uint32(x, 10) ⊻
@@ -236,15 +234,40 @@ end
 """
     zuc_encrypt(ctx::ZUCContext, input::Vector{UInt8}) -> Vector{UInt8}
 
-Encrypt/decrypt data using ZUC. Returns Vector{UInt8}.
+Encrypt/decrypt data using ZUC.  Processes 4 bytes per 32-bit keystream word
+(per GM/T 0001-2012 standard).  No intermediate keystream buffer allocation.
 """
 function zuc_encrypt(ctx::ZUCContext, input::Vector{UInt8})
     n = length(input)
-    key_stream = zuc_generate_keystream(ctx, n)
     output = Vector{UInt8}(undef, n)
-    @inbounds for i in 1:n
-        output[i] = input[i] ⊻ (key_stream[i] & 0xFF)
+
+    bit_reorganization!(ctx)
+    f!(ctx)  # Discard the first output
+
+    n_full = n & ~3  # largest multiple of 4 <= n
+
+    @inbounds for i in 1:4:n_full
+        lfsr_shift!(ctx)
+        bit_reorganization!(ctx)
+        z = f!(ctx) ⊻ ctx.x[4]
+
+        output[i]     = input[i]     ⊻ (z >> 24)
+        output[i + 1] = input[i + 1] ⊻ ((z >> 16) & 0xff)
+        output[i + 2] = input[i + 2] ⊻ ((z >> 8) & 0xff)
+        output[i + 3] = input[i + 3] ⊻ (z & 0xff)
     end
+
+    # Handle remaining 1-3 bytes using next keystream word
+    if n_full < n
+        lfsr_shift!(ctx)
+        bit_reorganization!(ctx)
+        z = f!(ctx) ⊻ ctx.x[4]
+        for j in 0:(n - n_full - 1)
+            output[n_full + j + 1] = input[n_full + j + 1] ⊻ ((z >> (24 - 8 * j)) & 0xff)
+        end
+    end
+
+    lfsr_shift!(ctx)
     return output
 end
 
