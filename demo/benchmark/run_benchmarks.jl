@@ -22,11 +22,13 @@ println("SnowlandSMX.jl Performance Benchmarks")
 println("="^50)
 println()
 
-run_bench_script("SM4", "sm4_standalone.jl")
+all_ok = true
+all_ok &= run_bench_script("SM4", "sm4_standalone_v2.jl")
 println()
-run_bench_script("SM3", "sm3_standalone.jl")
+all_ok &= run_bench_script("SM3", "sm3_standalone_v2.jl")
 println()
-run_bench_script("ZUC", "zuc_standalone.jl")
+all_ok &= run_bench_script("ZUC", "zuc_standalone_v2.jl")
 
 println()
 println("Benchmarks complete.")
+exit(all_ok ? 0 : 1)
