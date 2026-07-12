@@ -43,6 +43,7 @@ mutable struct SM3Context
     iv::Vector{UInt32}       # 当前哈希状态（8 个 UInt32）
     block::Vector{UInt8}     # 缓存的部分块
     length::Int              # 累计字节数
+    w::Vector{UInt32}        # 可复用的 68-UInt32 消息扩展缓冲区
 end
 ```
 
@@ -60,6 +61,7 @@ end
 |------|------|-------|
 | `IV` | `Vector{UInt32}` (8) | SM3 初始哈希值 |
 | `T_j` | `Vector{UInt32}` (64) | 轮常数 |
+| `T_j_rot` | `Vector{UInt32}` (64) | 预计算的 rotate_left(T_j[j], j-1) |
 | `hexdigest` | 别名 | = `sm3_hash` |
 
 ### 一次性哈希函数
@@ -186,7 +188,8 @@ sm3_digest("abc")  # => 32-byte Vector{UInt8}
 | `P_1` | `(X::UInt32) -> UInt32` | 置换 P1 |
 | `FF_j` | `(X, Y, Z, j) -> UInt32` | 布尔函数 FF（j<16: XOR, j>=16: majority） |
 | `GG_j` | `(X, Y, Z, j) -> UInt32` | 布尔函数 GG（j<16: XOR, j>=16: choice） |
-| `CF` | `(V_i, B_i) -> Vector{UInt32}` | 压缩函数 |
+| `CF` | `(V_i, B_i) -> Vector{UInt32}` | 压缩函数（分配新 V） |
+| `CF!` | `(V, block, off, W)` | 就地压缩函数（零分配，带可复用 W） |
 | `PUT_UINT32_BE` | `(n::UInt32) -> Vector{UInt8}` | UInt32 转为 4 字节大端序 |
 
 ### 工具函数
@@ -207,6 +210,15 @@ sm3_digest("abc")  # => 32-byte Vector{UInt8}
 |------|------|-------|
 | `ENCRYPT` | `Int` | `0` |
 | `DECRYPT` | `Int` | `1` |
+| `SM4_MODE_ECB` | `Int` | `0` |
+| `SM4_MODE_CBC` | `Int` | `1` |
+| `SM4_MODE_CFB` | `Int` | `2` |
+| `SM4_MODE_OFB` | `Int` | `3` |
+| `SM4_MODE_CTR` | `Int` | `4` |
+| `SM4_T0` | `Vector{UInt32}` (256) | 预计算 T-table（字节 0） |
+| `SM4_T1` | `Vector{UInt32}` (256) | 预计算 T-table（字节 1） |
+| `SM4_T2` | `Vector{UInt32}` (256) | 预计算 T-table（字节 2） |
+| `SM4_T3` | `Vector{UInt32}` (256) | 预计算 T-table（字节 3） |
 
 ### 类型
 
@@ -225,51 +237,74 @@ end
 
 ---
 
-#### `Sm4Ctr`
+#### `Sm4Stream`（推荐）
 
-CTR 模式流式上下文，**推荐**用于大数据量场景。
+统一 SM4 流式加解密上下文。单一类型同时支持五种模式（ECB、CBC、CFB、OFB、CTR），通过构造时的 `mode` 参数选择算法。
 
 ```julia
-mutable struct Sm4Ctr
-    sk::Vector{UInt32}      # 32 个扩展轮密钥（加密方向）
-    ctr::Vector{UInt8}      # 16 字节计数器块
-    kstream::Vector{UInt8}  # 16 字节加密后的计数器
-    kpos::Int               # 当前字节偏移（17 表示需要重新填充）
+mutable struct Sm4Stream
+    sk::Vector{UInt32}      # 32 个扩展轮密钥
+    mode::Int               # SM4_MODE_ECB .. SM4_MODE_CTR
+    dir::Int                # ENCRYPT 或 DECRYPT
+    # ... 内部状态随模式变化
 end
 ```
 
-构造函数: `Sm4Ctr(key::Vector{UInt8}, iv::Vector{UInt8})`
+构造函数: `Sm4Stream(key::Vector{UInt8}, iv::Vector{UInt8}, mode::Int, dir::Int=ENCRYPT)`
 
 | 参数 | 类型 | 描述 |
 |-----------|------|-------------|
 | `key` | `Vector{UInt8}` | 16 字节密钥 |
-| `iv` | `Vector{UInt8}` | 16 字节初始计数器 |
+| `iv` | `Vector{UInt8}` | 16 字节初始向量（ECB 模式不使用） |
+| `mode` | `Int` | `SM4_MODE_ECB/CBC/CFB/OFB/CTR` |
+| `dir` | `Int` | `ENCRYPT(0)` 或 `DECRYPT(1)`（OFB/CTR 模式忽略） |
+
+**模式总览:**
+
+| 模式 | 填充 | dir 影响 | 输出粒度 | `final!` |
+|------|------|----------|----------|----------|
+| `SM4_MODE_ECB` | 无 | 是 | 16 字节块 | 部分数据报错 |
+| `SM4_MODE_CBC` | PKCS7 | 是 | 字节级 | 填充/去填充 PKCS7 |
+| `SM4_MODE_CFB` | 无 | 输入来源 | 16 字节块 | 无操作（返回 0） |
+| `SM4_MODE_OFB` | 无 | 否 | 字节级 | 无操作（返回 0） |
+| `SM4_MODE_CTR` | 无 | 否 | 字节级 | 无操作（返回 0） |
+
+```julia
+# CTR 模式（加解密相同）
+ctx = Sm4Stream(key, iv, SM4_MODE_CTR)
+sm4_stream_update!(ctx, input, output)
+
+# CBC 加密（带 PKCS7 填充）
+ctx = Sm4Stream(key, iv, SM4_MODE_CBC, ENCRYPT)
+n = sm4_stream_update!(ctx, plaintext, output)
+rem = sm4_stream_final!(ctx, output, n + 1)
+
+# OFB 模式（流密码，加解密相同）
+ctx = Sm4Stream(key, iv, SM4_MODE_OFB)
+sm4_stream_update!(ctx, input, output)
+```
+
+> **注意:** `Sm4Stream` 是推荐的流式 API。OFB/CTR 模式下加解密为同一操作 -- 均与密钥流异或。CBC 模式下加密用 `ENCRYPT`，解密用 `DECRYPT`。
 
 ---
 
-#### `Sm4Cbc`
+#### `Sm4Ctr`（旧版）
 
-CBC 模式流式上下文，含 PKCS7 填充。
+CTR 模式的旧版构造函数别名。**已过时** -- 推荐使用 `Sm4Stream(key, iv, SM4_MODE_CTR)`。
 
-```julia
-mutable struct Sm4Cbc
-    sk::Vector{UInt32}    # 32 个轮密钥
-    chain::Vector{UInt8}  # 16 字节链接块
-    buffer::Vector{UInt8} # 16 字节溢出缓冲区
-    buf_len::Int          # 缓冲区中的字节数（0..15）
-    mode::Int             # ENCRYPT 或 DECRYPT
-end
-```
+构造函数: `Sm4Ctr(key::Vector{UInt8}, iv::Vector{UInt8})`
+
+等价于 `Sm4Stream(key, iv, SM4_MODE_CTR)`。
+
+---
+
+#### `Sm4Cbc`（旧版）
+
+CBC 模式的旧版构造函数别名。**已过时** -- 推荐使用 `Sm4Stream(key, iv, SM4_MODE_CBC, mode)`。
 
 构造函数: `Sm4Cbc(key::Vector{UInt8}, iv::Vector{UInt8}, mode::Int)`
 
-| 参数 | 类型 | 描述 |
-|-----------|------|-------------|
-| `key` | `Vector{UInt8}` | 16 字节密钥 |
-| `iv` | `Vector{UInt8}` | 16 字节初始化向量 |
-| `mode` | `Int` | `ENCRYPT(0)` 或 `DECRYPT(1)` |
-
-> **错误:** 若 IV 长度不为 16 或 mode 无效时抛出异常。
+等价于 `Sm4Stream(key, iv, SM4_MODE_CBC, mode)`。
 
 ### 密钥设置
 
@@ -329,81 +364,114 @@ SM4-CBC 加解密。创建临时上下文。
 
 使用预配置上下文的 CBC。
 
-### 流式 CTR 模式（推荐用于大数据量）
+### 统一流式 API（推荐）
 
-#### `sm4_ctr_xor!(ctx::Sm4Ctr, input, output) -> Int`
+`Sm4Stream` 类型通过两个函数提供与模式无关的接口：
 
-CTR 模式异或。将 `input` 加密/解密到 `output`。无填充 -- 输出长度始终等于输入长度。
+---
+
+#### `sm4_stream_update!(ctx::Sm4Stream, input, output) -> Int`
+
+向流中送入 `input` 数据。返回写入 `output` 的字节数。内部按 `ctx.mode` 分发。
 
 | 参数 | 类型 | 描述 |
 |-----------|------|-------------|
-| `ctx` | `Sm4Ctr` | CTR 上下文 |
+| `ctx` | `Sm4Stream` | 流式上下文 |
 | `input` | `AbstractVector{UInt8}` | 明文或密文 |
-| `output` | `AbstractVector{UInt8}` | 输出缓冲区（必须 >= 输入长度） |
+| `output` | `AbstractVector{UInt8}` | 输出缓冲区（流式模式需 >= 输入长度，块模式需 >= floor(len/16)*16） |
+
+**返回:** 写入 `output` 的字节数。
+
+**各模式行为:**
+- **ECB**: 处理完整 16 字节块，不足部分缓存。
+- **CBC 加密**: 处理完整块，不足部分缓存。
+- **CBC 解密**: 累积密文，输出除最后一块外的所有完整块。
+- **CFB**: 按 16 字节块处理，不足部分缓存。
+- **OFB**: 流密码，立即处理所有字节（无缓冲）。
+- **CTR**: 流密码，立即处理所有字节（无缓冲）。
+
+---
+
+#### `sm4_stream_final!(ctx::Sm4Stream, output, offset=1) -> Int`
+
+完成流式处理。返回从 `offset` 位置开始额外写入 `output` 的字节数。
+
+| 参数 | 类型 | 描述 |
+|-----------|------|-------------|
+| `ctx` | `Sm4Stream` | 流式上下文 |
+| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
+| `offset` | `Int` | 写入起始位置（1 为起始，默认 1） |
+
+**返回:** 额外写入的字节数。
+
+**各模式行为:**
+- **ECB**: 若存在不完整的块则报错（要求块对齐输入）。
+- **CBC 加密**: 应用 PKCS7 填充，加密最后一块，返回 16。
+- **CBC 解密**: 解密最后一块，去除 PKCS7 填充，返回明文长度。
+- **CFB/OFB/CTR**: 无操作，始终返回 0。
+
+> **注意:** `final!` 之后不应再复用该上下文。
+
+```julia
+# 示例: CBC 流式加密
+ctx = Sm4Stream(key, iv, SM4_MODE_CBC, ENCRYPT)
+out = zeros(UInt8, expected_size)
+n = sm4_stream_update!(ctx, chunk1, out)
+n += sm4_stream_update!(ctx, chunk2, view(out, n+1:end))
+n += sm4_stream_final!(ctx, out, n + 1)
+ciphertext = view(out, 1:n)  # 含 PKCS7 填充
+
+# 示例: OFB 流式加密（无填充）
+ctx = Sm4Stream(key, iv, SM4_MODE_OFB)
+out = zeros(UInt8, length(data))
+sm4_stream_update!(ctx, data, out)  # out == 密文
+```
+
+### 旧版流式函数（向后兼容）
+
+以下旧版函数内部委托到 `Sm4Stream`。它们仍然被导出以保证向后兼容，但**新代码推荐使用 `Sm4Stream` + `sm4_stream_update!`/`sm4_stream_final!`**。
+
+---
+
+#### `sm4_ctr_xor!(ctx::Sm4Stream, input, output) -> Int`
+
+旧版 CTR 模式异或。委托到 `sm4_stream_update!`。
+
+| 参数 | 类型 | 描述 |
+|-----------|------|-------------|
+| `ctx` | `Sm4Stream` | CTR 上下文 (`SM4_MODE_CTR`) |
+| `input` | `AbstractVector{UInt8}` | 明文或密文 |
+| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
 
 **返回:** 处理的字节数（= `length(input)`）。
 
 > **注意:** CTR 模式内部仅使用加密方向。加解密为相同操作。
 
-### 流式 CBC 模式
+---
 
-#### `sm4_cbc_encrypt_update!(ctx::Sm4Cbc, input, output) -> Int`
+#### `sm4_cbc_encrypt_update!(ctx::Sm4Stream, input, output) -> Int`
 
-向 CBC 加密流中送入明文。
-
-| 参数 | 类型 | 描述 |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC 上下文（mode = ENCRYPT） |
-| `input` | `AbstractVector{UInt8}` | 明文 |
-| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
-
-**返回:** 写入字节数（始终为 16 的倍数）。不足一块的数据在内部缓存。
+旧版 CBC 加密更新。委托到 `sm4_stream_update!`。
 
 ---
 
-#### `sm4_cbc_encrypt_final!(ctx::Sm4Cbc, output, offset=1) -> Int`
+#### `sm4_cbc_encrypt_final!(ctx::Sm4Stream, output, offset=1) -> Int`
 
-完成 CBC 加密。应用 PKCS7 填充并写入最后一块。
-
-| 参数 | 类型 | 描述 |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC 上下文 |
-| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
-| `offset` | `Int` | 写入起始位置（1 为起始，默认 1） |
-
-**返回:** 写入字节数（16，始终为一个带填充的块）。
-
-> **注意:** `final!` 之后不应再复用该上下文。
+旧版 CBC 加密完成。委托到 `sm4_stream_final!`。返回 16 字节（一个带填充的块）。
 
 ---
 
-#### `sm4_cbc_decrypt_update!(ctx::Sm4Cbc, input, output) -> Int`
+#### `sm4_cbc_decrypt_update!(ctx::Sm4Stream, input, output) -> Int`
 
-向 CBC 解密流中送入密文。
-
-| 参数 | 类型 | 描述 |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC 上下文（mode = DECRYPT） |
-| `input` | `AbstractVector{UInt8}` | 密文 |
-| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
-
-**返回:** 写入字节数（16 的倍数）。最后一块始终保留，在 `final!` 中做 PKCS7 校验。
+旧版 CBC 解密更新。委托到 `sm4_stream_update!`。
 
 > **注意:** 输出需留出 `max(0, floor((buf_len + len(input))/16) - 1) * 16` 字节空间。至少累积 2 个完整块后才有输出。
 
 ---
 
-#### `sm4_cbc_decrypt_final!(ctx::Sm4Cbc, output, offset=1) -> Int`
+#### `sm4_cbc_decrypt_final!(ctx::Sm4Stream, output, offset=1) -> Int`
 
-完成 CBC 解密。解密最后一块，去除 PKCS7 填充。
-
-| 参数 | 类型 | 描述 |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC 上下文 |
-| `output` | `AbstractVector{UInt8}` | 输出缓冲区 |
-| `offset` | `Int` | 写入起始位置 |
-
-**返回:** 写入明文字节数（<= 16）。
+旧版 CBC 解密完成。委托到 `sm4_stream_final!`。返回明文字节数（<= 16）。
 
 > **错误:** 若剩余数据不为 16 字节或填充无效时抛出异常。
 
@@ -985,5 +1053,6 @@ end
 | `_bigint_to_hex` | `(x::BigInt, len::Int) -> String` | BigInt 转定长十六进制 |
 | `_rand_bytes` | `(n::Int) -> Vector{UInt8}` | CSPRNG 随机字节 |
 | `_rand_bigint` | `(n_bytes::Int) -> BigInt` | 随机 BigInt |
+| `_bytes_to_bigint` | `(b::Vector{UInt8}) -> BigInt` | 大端序字节转 BigInt（无 hex 中转） |
 | `_put_u32_be!` | `(buf, off, n::UInt32)` | 写入 UInt32 大端序 |
 | `_get_u32_be` | `(data, off=1) -> UInt32` | 读取 UInt32 大端序 |

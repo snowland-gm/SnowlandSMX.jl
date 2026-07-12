@@ -43,6 +43,7 @@ mutable struct SM3Context
     iv::Vector{UInt32}       # current hash state (8 x UInt32)
     block::Vector{UInt8}     # buffered partial block
     length::Int              # total bytes accumulated
+    w::Vector{UInt32}        # reusable 68-UInt32 buffer for message expansion
 end
 ```
 
@@ -60,6 +61,7 @@ Constructors:
 |------|------|-------|
 | `IV` | `Vector{UInt32}` (8) | SM3 initial hash value |
 | `T_j` | `Vector{UInt32}` (64) | Round constants |
+| `T_j_rot` | `Vector{UInt32}` (64) | Precomputed rotate_left(T_j[j], j-1) |
 | `hexdigest` | alias | = `sm3_hash` |
 
 ### One-Shot Hash Functions
@@ -186,7 +188,8 @@ These are exported as building blocks:
 | `P_1` | `(X::UInt32) -> UInt32` | Permutation P1 |
 | `FF_j` | `(X, Y, Z, j) -> UInt32` | Boolean function FF (j<16: XOR, j>=16: majority) |
 | `GG_j` | `(X, Y, Z, j) -> UInt32` | Boolean function GG (j<16: XOR, j>=16: choice) |
-| `CF` | `(V_i, B_i) -> Vector{UInt32}` | Compression function |
+| `CF` | `(V_i, B_i) -> Vector{UInt32}` | Compression function (allocates new V) |
+| `CF!` | `(V, block, off, W)` | In-place compression (zero allocation, with reusable W) |
 | `PUT_UINT32_BE` | `(n::UInt32) -> Vector{UInt8}` | UInt32 to 4-byte big-endian |
 
 ### Utility
@@ -207,6 +210,15 @@ Convert bytes to lowercase hex string.
 |------|------|-------|
 | `ENCRYPT` | `Int` | `0` |
 | `DECRYPT` | `Int` | `1` |
+| `SM4_MODE_ECB` | `Int` | `0` |
+| `SM4_MODE_CBC` | `Int` | `1` |
+| `SM4_MODE_CFB` | `Int` | `2` |
+| `SM4_MODE_OFB` | `Int` | `3` |
+| `SM4_MODE_CTR` | `Int` | `4` |
+| `SM4_T0` | `Vector{UInt32}` (256) | Precomputed T-table (byte 0) |
+| `SM4_T1` | `Vector{UInt32}` (256) | Precomputed T-table (byte 1) |
+| `SM4_T2` | `Vector{UInt32}` (256) | Precomputed T-table (byte 2) |
+| `SM4_T3` | `Vector{UInt32}` (256) | Precomputed T-table (byte 3) |
 
 ### Types
 
@@ -225,51 +237,74 @@ Constructor: `Sm4()`
 
 ---
 
-#### `Sm4Ctr`
+#### `Sm4Stream` (Recommended)
 
-CTR-mode streaming context. **Recommended** for large data.
+Unified SM4 streaming cipher context. A single type handles all five modes (ECB, CBC, CFB, OFB, CTR); the mode is selected at construction time via the `mode` parameter.
 
 ```julia
-mutable struct Sm4Ctr
-    sk::Vector{UInt32}      # 32 expanded round keys (ENCRYPT direction)
-    ctr::Vector{UInt8}      # 16-byte counter block
-    kstream::Vector{UInt8}  # 16-byte encrypted counter
-    kpos::Int               # current byte offset in kstream (17 = needs refill)
+mutable struct Sm4Stream
+    sk::Vector{UInt32}      # 32 expanded round keys
+    mode::Int               # SM4_MODE_ECB .. SM4_MODE_CTR
+    dir::Int                # ENCRYPT or DECRYPT
+    # ... internal state varies by mode
 end
 ```
 
-Constructor: `Sm4Ctr(key::Vector{UInt8}, iv::Vector{UInt8})`
+Constructor: `Sm4Stream(key::Vector{UInt8}, iv::Vector{UInt8}, mode::Int, dir::Int=ENCRYPT)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `key` | `Vector{UInt8}` | 16-byte key |
-| `iv` | `Vector{UInt8}` | 16-byte initial counter |
+| `iv` | `Vector{UInt8}` | 16-byte IV (unused for ECB) |
+| `mode` | `Int` | `SM4_MODE_ECB/CBC/CFB/OFB/CTR` |
+| `dir` | `Int` | `ENCRYPT(0)` or `DECRYPT(1)` (ignored for OFB/CTR) |
+
+**Mode Summary:**
+
+| Mode | Padding | dir affects | Output Granularity | `final!` |
+|------|---------|-------------|--------------------|----------|
+| `SM4_MODE_ECB` | None | Yes | 16-byte blocks | errors on partial |
+| `SM4_MODE_CBC` | PKCS7 | Yes | byte-level | pad/strip PKCS7 |
+| `SM4_MODE_CFB` | None | Input src | 16-byte blocks | no-op (returns 0) |
+| `SM4_MODE_OFB` | None | No | byte-level | no-op (returns 0) |
+| `SM4_MODE_CTR` | None | No | byte-level | no-op (returns 0) |
+
+```julia
+# CTR mode (encrypt and decrypt are identical)
+ctx = Sm4Stream(key, iv, SM4_MODE_CTR)
+sm4_stream_update!(ctx, input, output)
+
+# CBC encrypt with PKCS7 padding
+ctx = Sm4Stream(key, iv, SM4_MODE_CBC, ENCRYPT)
+n = sm4_stream_update!(ctx, plaintext, output)
+rem = sm4_stream_final!(ctx, output, n + 1)
+
+# OFB mode (stream cipher, encrypt/decrypt identical)
+ctx = Sm4Stream(key, iv, SM4_MODE_OFB)
+sm4_stream_update!(ctx, input, output)
+```
+
+> **Note:** `Sm4Stream` is the recommended streaming API. For OFB/CTR, encryption and decryption are the same operation -- both XOR the keystream. For CBC, use `ENCRYPT` for encryption and `DECRYPT` for decryption.
 
 ---
 
-#### `Sm4Cbc`
+#### `Sm4Ctr` (Legacy)
 
-CBC-mode streaming context with PKCS7 padding.
+Legacy alias for CTR mode. **Deprecated** -- prefer `Sm4Stream(key, iv, SM4_MODE_CTR)`.
 
-```julia
-mutable struct Sm4Cbc
-    sk::Vector{UInt32}    # 32 round keys
-    chain::Vector{UInt8}  # 16-byte chaining block
-    buffer::Vector{UInt8} # 16-byte overflow buffer
-    buf_len::Int          # bytes in buffer (0..15)
-    mode::Int             # ENCRYPT or DECRYPT
-end
-```
+Constructor: `Sm4Ctr(key::Vector{UInt8}, iv::Vector{UInt8})`
+
+Equivalent to `Sm4Stream(key, iv, SM4_MODE_CTR)`.
+
+---
+
+#### `Sm4Cbc` (Legacy)
+
+Legacy alias for CBC mode. **Deprecated** -- prefer `Sm4Stream(key, iv, SM4_MODE_CBC, mode)`.
 
 Constructor: `Sm4Cbc(key::Vector{UInt8}, iv::Vector{UInt8}, mode::Int)`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `key` | `Vector{UInt8}` | 16-byte key |
-| `iv` | `Vector{UInt8}` | 16-byte initialization vector |
-| `mode` | `Int` | `ENCRYPT(0)` or `DECRYPT(1)` |
-
-> **Error:** Throws if IV length != 16 or mode is invalid.
+Equivalent to `Sm4Stream(key, iv, SM4_MODE_CBC, mode)`.
 
 ### Key Setup
 
@@ -329,81 +364,114 @@ SM4-CBC encryption/decryption. Creates a temporary context.
 
 CBC with pre-configured context.
 
-### Streaming CTR Mode (Recommended for Large Data)
+### Unified Streaming API (Recommended)
 
-#### `sm4_ctr_xor!(ctx::Sm4Ctr, input, output) -> Int`
+The `Sm4Stream` type provides a mode-agnostic interface via two functions:
 
-CTR-mode XOR. Encrypts or decrypts `input` into `output`. No padding -- output length always equals input length.
+---
+
+#### `sm4_stream_update!(ctx::Sm4Stream, input, output) -> Int`
+
+Feed `input` into the stream. Returns the number of bytes written to `output`. Dispatches internally based on `ctx.mode`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `ctx` | `Sm4Ctr` | CTR context |
+| `ctx` | `Sm4Stream` | Streaming context |
 | `input` | `AbstractVector{UInt8}` | Plaintext or ciphertext |
-| `output` | `AbstractVector{UInt8}` | Output buffer (must be >= length(input)) |
+| `output` | `AbstractVector{UInt8}` | Output buffer (must be >= length(input) for stream modes, >= floor(len/16)*16 for block modes) |
+
+**Return:** Number of bytes written to `output`.
+
+**Mode behavior:**
+- **ECB**: processes full 16-byte blocks; partial bytes are buffered.
+- **CBC encrypt**: processes full blocks; partial bytes are buffered.
+- **CBC decrypt**: accumulates ciphertext; outputs all complete blocks except the last.
+- **CFB**: processes in 16-byte blocks; partial bytes are buffered.
+- **OFB**: stream cipher, processes all bytes immediately (no buffering).
+- **CTR**: stream cipher, processes all bytes immediately (no buffering).
+
+---
+
+#### `sm4_stream_final!(ctx::Sm4Stream, output, offset=1) -> Int`
+
+Finalize the stream. Returns the number of additional bytes written to `output` starting at `offset`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `ctx` | `Sm4Stream` | Streaming context |
+| `output` | `AbstractVector{UInt8}` | Output buffer |
+| `offset` | `Int` | Write position (1-based, default=1) |
+
+**Return:** Number of additional bytes written.
+
+**Mode behavior:**
+- **ECB**: errors if partial block remains (requires block-aligned input).
+- **CBC encrypt**: applies PKCS7 padding, encrypts the last block, returns 16.
+- **CBC decrypt**: decrypts the last block, strips PKCS7 padding, returns plaintext length.
+- **CFB/OFB/CTR**: no-op, always returns 0.
+
+> **Note:** Context should not be reused after `final!`.
+
+```julia
+# Example: CBC encrypt with streaming
+ctx = Sm4Stream(key, iv, SM4_MODE_CBC, ENCRYPT)
+out = zeros(UInt8, expected_size)
+n = sm4_stream_update!(ctx, chunk1, out)
+n += sm4_stream_update!(ctx, chunk2, view(out, n+1:end))
+n += sm4_stream_final!(ctx, out, n + 1)
+ciphertext = view(out, 1:n)  # includes PKCS7 padding
+
+# Example: OFB stream encryption (no padding)
+ctx = Sm4Stream(key, iv, SM4_MODE_OFB)
+out = zeros(UInt8, length(data))
+sm4_stream_update!(ctx, data, out)  # out == ciphertext
+```
+
+### Legacy Streaming Functions (Backward Compatible)
+
+The following legacy functions delegate to `Sm4Stream` internally. They remain exported for backward compatibility but **prefer `Sm4Stream` with `sm4_stream_update!`/`sm4_stream_final!`** for new code.
+
+---
+
+#### `sm4_ctr_xor!(ctx::Sm4Stream, input, output) -> Int`
+
+Legacy CTR-mode XOR. Delegates to `sm4_stream_update!`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `ctx` | `Sm4Stream` | CTR context (`SM4_MODE_CTR`) |
+| `input` | `AbstractVector{UInt8}` | Plaintext or ciphertext |
+| `output` | `AbstractVector{UInt8}` | Output buffer |
 
 **Return:** Number of bytes processed (= `length(input)`).
 
 > **Note:** CTR mode uses only the encrypt direction internally. Encryption and decryption are identical operations.
 
-### Streaming CBC Mode
+---
 
-#### `sm4_cbc_encrypt_update!(ctx::Sm4Cbc, input, output) -> Int`
+#### `sm4_cbc_encrypt_update!(ctx::Sm4Stream, input, output) -> Int`
 
-Feed plaintext into CBC encryption stream.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC context (mode = ENCRYPT) |
-| `input` | `AbstractVector{UInt8}` | Plaintext |
-| `output` | `AbstractVector{UInt8}` | Output buffer |
-
-**Return:** Number of bytes written (always a multiple of 16). Partial block is buffered internally.
+Legacy CBC encryption update. Delegates to `sm4_stream_update!`.
 
 ---
 
-#### `sm4_cbc_encrypt_final!(ctx::Sm4Cbc, output, offset=1) -> Int`
+#### `sm4_cbc_encrypt_final!(ctx::Sm4Stream, output, offset=1) -> Int`
 
-Finalize CBC encryption. Applies PKCS7 padding and writes final block(s).
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC context |
-| `output` | `AbstractVector{UInt8}` | Output buffer |
-| `offset` | `Int` | Write position (1-based, default=1) |
-
-**Return:** Number of bytes written (16, always one block with padding).
-
-> **Note:** Context should not be reused after `final!`.
+Legacy CBC encryption finalize. Delegates to `sm4_stream_final!`. Returns 16 bytes (one padded block).
 
 ---
 
-#### `sm4_cbc_decrypt_update!(ctx::Sm4Cbc, input, output) -> Int`
+#### `sm4_cbc_decrypt_update!(ctx::Sm4Stream, input, output) -> Int`
 
-Feed ciphertext into CBC decryption stream.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC context (mode = DECRYPT) |
-| `input` | `AbstractVector{UInt8}` | Ciphertext |
-| `output` | `AbstractVector{UInt8}` | Output buffer |
-
-**Return:** Number of bytes written (multiple of 16). Last block is always held back for PKCS7 validation in `final!`.
+Legacy CBC decryption update. Delegates to `sm4_stream_update!`.
 
 > **Note:** Output requires space for `max(0, floor((buf_len + len(input))/16) - 1) * 16` bytes. At least 2 full blocks must accumulate before any output.
 
 ---
 
-#### `sm4_cbc_decrypt_final!(ctx::Sm4Cbc, output, offset=1) -> Int`
+#### `sm4_cbc_decrypt_final!(ctx::Sm4Stream, output, offset=1) -> Int`
 
-Finalize CBC decryption. Decrypts last block, removes PKCS7 padding.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ctx` | `Sm4Cbc` | CBC context |
-| `output` | `AbstractVector{UInt8}` | Output buffer |
-| `offset` | `Int` | Write position (1-based) |
-
-**Return:** Number of plaintext bytes written (<= 16).
+Legacy CBC decryption finalize. Delegates to `sm4_stream_final!`. Returns plaintext bytes (<= 16).
 
 > **Error:** Throws if remaining data != 16 bytes or padding is invalid.
 
@@ -985,5 +1053,6 @@ Shared functions included inline in SM2, SM4, SM9, and ZUC modules. **Not export
 | `_bigint_to_hex` | `(x::BigInt, len::Int) -> String` | BigInt to zero-padded hex |
 | `_rand_bytes` | `(n::Int) -> Vector{UInt8}` | CSPRNG random bytes |
 | `_rand_bigint` | `(n_bytes::Int) -> BigInt` | Random BigInt |
+| `_bytes_to_bigint` | `(b::Vector{UInt8}) -> BigInt` | Big-endian bytes to BigInt (no hex) |
 | `_put_u32_be!` | `(buf, off, n::UInt32)` | Write UInt32 big-endian |
 | `_get_u32_be` | `(data, off=1) -> UInt32` | Read UInt32 big-endian |
